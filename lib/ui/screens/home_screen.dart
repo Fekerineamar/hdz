@@ -30,6 +30,9 @@ class _ChatSession {
   bool busy = false;
   bool dialogOpen = false;
 
+  /// Active status message (e.g. Thinking..., Running...) while agent is running.
+  String? activeStatus;
+
   /// Active user session if logged in.
   UserSession? userSession;
 
@@ -145,7 +148,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _tryParseCredentials(session, event.text);
         _checkAlreadyRegistered(session, event.text);
       case AgentStatus():
-        _add(session, _ChatItem.status(event.text));
+        setState(() {
+          session.activeStatus = event.text;
+        });
       case AgentNeedCaptcha():
         _showCaptcha(session, event.puzzle);
       case AgentNeedSms():
@@ -153,12 +158,18 @@ class _HomeScreenState extends State<HomeScreen> {
       case AgentNeedDocument():
         _pickBothSidesDocument(session);
       case AgentDone():
+        setState(() {
+          session.activeStatus = null;
+        });
         _add(session, _ChatItem.agent(event.text));
         _tryParseCredentials(session, event.text);
         _checkAlreadyRegistered(session, event.text);
         _setBusy(session, false);
         session.agent.checkSession();
       case AgentError():
+        setState(() {
+          session.activeStatus = null;
+        });
         _add(session, _ChatItem.error(event.text));
         _checkAlreadyRegistered(session, event.text);
         _setBusy(session, false);
@@ -278,20 +289,57 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _setBusy(_ChatSession session, bool v) {
     if (!mounted) return;
-    setState(() => session.busy = v);
+    setState(() {
+      session.busy = v;
+      if (!v) session.activeStatus = null;
+    });
   }
 
   // -------------------------------------------------------------------------
   // User actions
   // -------------------------------------------------------------------------
 
-  void _send() {
+  bool _isCertificateOrServiceRequest(String text) {
+    final lower = text.toLowerCase();
+    final keywords = [
+      'شهادة', 'استخراج', 'سوابق', 'ميلاد', 'إقامة', 'اقامة', 
+      'جنسية', 'انتساب', 'بطاقة', 'عقد', 'وثيقة', 'cnas', 'casnos',
+      'عدم الانتساب', 'عدم الإنتساب', 'الضرائب', 'ضريبة', 'طلب'
+    ];
+    return keywords.any((k) => lower.contains(k));
+  }
+
+  Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty || _chat.busy) return;
     _controller.clear();
     _add(_chat, _ChatItem.user(text));
+
+    final isLoggedIn = _chat.userSession != null;
+    final savedUsername = await SecureStore.instance.username ?? '';
+    final savedPassword = await SecureStore.instance.password ?? '';
+
+    // If NOT logged in and NO saved credentials:
+    if (!isLoggedIn && (savedUsername.isEmpty || savedPassword.isEmpty)) {
+      if (_isCertificateOrServiceRequest(text)) {
+        _add(_chat, _ChatItem.authPrompt(
+          title: 'يلزم بطاقة التعريف لاستخراج الوثائق',
+          text: 'لاستخراج الوثائق والشهادات الرسمية فوراً، يرجى رفع بطاقة التعريف الوطنية (الواجهتين) ليتم استخراج بياناتك وإنشاء حسابك والدخول تلقائياً، أو تسجيل الدخول بحسابك.',
+          onUpload: () => _uploadAndRegisterBothSides(),
+          onLogin: () => _promptLoginPassword(_chat),
+        ));
+        return;
+      }
+    }
+
     _setBusy(_chat, true);
-    _chat.agent.start(text);
+    if (!isLoggedIn && savedUsername.isNotEmpty && savedPassword.isNotEmpty) {
+      _chat.agent.start(
+        '$text (الحساب المحفوظ في النظام: اسم المستخدم $savedUsername وكلمة المرور $savedPassword. سجّل الدخول بهما مباشرة).',
+      );
+    } else {
+      _chat.agent.start(text);
+    }
   }
 
   void _stop() {
@@ -300,15 +348,44 @@ class _HomeScreenState extends State<HomeScreen> {
       Navigator.of(context, rootNavigator: true).pop();
     }
     _setBusy(_chat, false);
-    _add(_chat, _ChatItem.status('تم الإيقاف.'));
+    _add(_chat, _ChatItem.agent('تم إيقاف المساعد.'));
   }
 
   // -------------------------------------------------------------------------
   // One-click certificate request
   // -------------------------------------------------------------------------
 
-  void _requestCertificate(String name, String unid) {
+  Future<void> _requestCertificate(String name, String unid) async {
     if (_chat.busy) return;
+
+    final isLoggedIn = _chat.userSession != null;
+    final savedUsername = await SecureStore.instance.username ?? '';
+    final savedPassword = await SecureStore.instance.password ?? '';
+
+    // Case 1: NOT logged in and NO saved credentials -> Zero-latency Code Prompt (No Gemini waste!)
+    if (!isLoggedIn && (savedUsername.isEmpty || savedPassword.isEmpty)) {
+      _add(_chat, _ChatItem.user('أريد استخراج $name لنفسي فوراً'));
+      _add(_chat, _ChatItem.authPrompt(
+        title: 'يلزم بطاقة التعريف لاستخراج $name',
+        text: 'لاستخراج $name فوراً عبر منصة DZDS الرسمية، يرجى رفع بطاقة التعريف الوطنية (الوجهين) ليقوم المساعد بإنشاء حسابك وتوليد بيانات الدخول تلقائياً، أو تسجيل الدخول إذا كنت مسجلاً مسبقاً.',
+        onUpload: () => _uploadAndRegisterBothSides(),
+        onLogin: () => _promptLoginPassword(_chat),
+      ));
+      return;
+    }
+
+    // Case 2: NOT logged in, but HAS saved credentials in SecureStore -> Auto-login with cert
+    if (!isLoggedIn && savedUsername.isNotEmpty && savedPassword.isNotEmpty) {
+      _add(_chat, _ChatItem.user('أريد استخراج $name لنفسي فوراً'));
+      _setBusy(_chat, true);
+      _chat.agent.start(
+        'استخرج $name (service_unid: $unid) لنفسي فوراً. '
+        'قم أولاً بتسجيل الدخول الفوري بالحساب المحفوظ (اسم المستخدم: $savedUsername، كلمة المرور: $savedPassword) ثم استخرج الشهادة فوراً.',
+      );
+      return;
+    }
+
+    // Case 3: Already logged in -> Instant cert fetch
     _add(_chat, _ChatItem.user('أريد استخراج $name لنفسي فوراً'));
     _setBusy(_chat, true);
     _chat.agent.start('أريد استخراج $name (service_unid: $unid) لنفسي فوراً.');
@@ -708,8 +785,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 : ListView.builder(
                     controller: _scrollController,
                     padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    itemCount: _chat.messages.length,
-                    itemBuilder: (_, i) => _chat.messages[i].build(context),
+                    itemCount: _chat.messages.length + (_chat.busy && _chat.activeStatus != null ? 1 : 0),
+                    itemBuilder: (_, i) {
+                      if (i < _chat.messages.length) {
+                        return _chat.messages[i].build(context);
+                      }
+                      return _buildActiveStatusIndicator(scheme, _chat.activeStatus!);
+                    },
                   ),
           ),
 
@@ -726,6 +808,34 @@ class _HomeScreenState extends State<HomeScreen> {
 
           // Bottom composer
           _buildComposer(scheme),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActiveStatusIndicator(ColorScheme scheme, String statusText) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2, color: scheme.primary),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              statusText,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w500,
+                fontStyle: FontStyle.italic,
+                color: scheme.outline,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -1274,16 +1384,45 @@ class _QuickAction extends StatelessWidget {
 // Chat item
 // ---------------------------------------------------------------------------
 
-enum _Kind { user, agent, status, error }
+enum _Kind { user, agent, status, error, authPrompt }
 
 class _ChatItem {
   final _Kind kind;
   final String text;
+  final String? title;
+  final VoidCallback? onUpload;
+  final VoidCallback? onLogin;
 
-  _ChatItem.user(this.text) : kind = _Kind.user;
-  _ChatItem.agent(this.text) : kind = _Kind.agent;
-  _ChatItem.status(this.text) : kind = _Kind.status;
-  _ChatItem.error(this.text) : kind = _Kind.error;
+  _ChatItem.user(this.text)
+      : kind = _Kind.user,
+        title = null,
+        onUpload = null,
+        onLogin = null;
+
+  _ChatItem.agent(this.text)
+      : kind = _Kind.agent,
+        title = null,
+        onUpload = null,
+        onLogin = null;
+
+  _ChatItem.status(this.text)
+      : kind = _Kind.status,
+        title = null,
+        onUpload = null,
+        onLogin = null;
+
+  _ChatItem.error(this.text)
+      : kind = _Kind.error,
+        title = null,
+        onUpload = null,
+        onLogin = null;
+
+  _ChatItem.authPrompt({
+    required this.title,
+    required this.text,
+    required this.onUpload,
+    required this.onLogin,
+  }) : kind = _Kind.authPrompt;
 
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -1384,6 +1523,76 @@ class _ChatItem {
                 child: Text(text, style: TextStyle(color: scheme.onErrorContainer, fontSize: 13)),
               ),
             ],
+          ),
+        );
+
+      case _Kind.authPrompt:
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 6),
+            padding: const EdgeInsets.all(16),
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.88,
+            ),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: scheme.primary.withOpacity(0.35), width: 1),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.04),
+                  blurRadius: 8,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 16,
+                      backgroundColor: scheme.primaryContainer,
+                      child: Icon(Icons.badge_rounded, size: 18, color: scheme.primary),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        title ?? 'يلزم بطاقة التعريف الوطنية',
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  text,
+                  style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13, height: 1.45),
+                ),
+                const SizedBox(height: 14),
+                FilledButton.icon(
+                  onPressed: onUpload,
+                  icon: const Icon(Icons.document_scanner_rounded, size: 18),
+                  label: const Text('رفع بطاقة التعريف (الواجهتين) الآن'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: onLogin,
+                  icon: const Icon(Icons.login_rounded, size: 18),
+                  label: const Text('تسجيل الدخول بحساب مسجّل مسبقاً'),
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                ),
+              ],
+            ),
           ),
         );
     }
