@@ -41,6 +41,9 @@ class _ChatSession {
 
   /// Last known certificate list.
   List<Certificate> certificates = [];
+
+  /// Stored document data from ID card extraction, so we never re-ask for images.
+  DocumentData? extractedDocument;
 }
 
 class _Credentials {
@@ -149,21 +152,27 @@ class _HomeScreenState extends State<HomeScreen> {
         _checkAlreadyRegistered(session, event.text);
       case AgentStatus():
         setState(() {
-          session.activeStatus = event.text;
+          session.activeStatus = event.text.isNotEmpty ? event.text : null;
         });
       case AgentNeedCaptcha():
         _showCaptcha(session, event.puzzle);
       case AgentNeedSms():
         _showSms(session);
       case AgentNeedDocument():
-        _pickBothSidesDocument(session);
+        if (session.extractedDocument != null) {
+          session.agent.resolveDocument(session.extractedDocument);
+        } else {
+          _pickBothSidesDocument(session);
+        }
       case AgentDone():
         setState(() {
           session.activeStatus = null;
         });
-        _add(session, _ChatItem.agent(event.text));
-        _tryParseCredentials(session, event.text);
-        _checkAlreadyRegistered(session, event.text);
+        if (event.text.trim().isNotEmpty) {
+          _add(session, _ChatItem.agent(event.text));
+          _tryParseCredentials(session, event.text);
+          _checkAlreadyRegistered(session, event.text);
+        }
         _setBusy(session, false);
         session.agent.checkSession();
       case AgentError():
@@ -322,6 +331,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // If NOT logged in and NO saved credentials:
     if (!isLoggedIn && (savedUsername.isEmpty || savedPassword.isEmpty)) {
       if (_isCertificateOrServiceRequest(text)) {
+        if (_chat.extractedDocument != null && _chat.extractedDocument!.fields.isNotEmpty) {
+          _add(_chat, _ChatItem.agent(
+            'تتوفر لدينا بيانات بطاقة التعريف الخاصة بك بالفعل! جاري إتمام التسجيل وتأكيد الحساب لمتابعة طلبك…',
+          ));
+          _executeRegistrationFlow(_chat.extractedDocument!.fields);
+          return;
+        }
         _add(_chat, _ChatItem.authPrompt(
           title: 'يلزم بطاقة التعريف لاستخراج الوثائق',
           text: 'لاستخراج الوثائق والشهادات الرسمية فوراً، يرجى رفع بطاقة التعريف الوطنية (الواجهتين) ليتم استخراج بياناتك وإنشاء حسابك والدخول تلقائياً، أو تسجيل الدخول بحسابك.',
@@ -365,6 +381,13 @@ class _HomeScreenState extends State<HomeScreen> {
     // Case 1: NOT logged in and NO saved credentials -> Zero-latency Code Prompt (No Gemini waste!)
     if (!isLoggedIn && (savedUsername.isEmpty || savedPassword.isEmpty)) {
       _add(_chat, _ChatItem.user('أريد استخراج $name لنفسي فوراً'));
+      if (_chat.extractedDocument != null && _chat.extractedDocument!.fields.isNotEmpty) {
+        _add(_chat, _ChatItem.agent(
+          'تتوفر لدينا بيانات بطاقة التعريف الخاصة بك بالفعل! جاري إتمام التسجيل وتأكيد الحساب لاستخراج $name فوراً…',
+        ));
+        await _executeRegistrationFlow(_chat.extractedDocument!.fields);
+        return;
+      }
       _add(_chat, _ChatItem.authPrompt(
         title: 'يلزم بطاقة التعريف لاستخراج $name',
         text: 'لاستخراج $name فوراً عبر منصة DZDS الرسمية، يرجى رفع بطاقة التعريف الوطنية (الوجهين) ليقوم المساعد بإنشاء حسابك وتوليد بيانات الدخول تلقائياً، أو تسجيل الدخول إذا كنت مسجلاً مسبقاً.',
@@ -394,6 +417,147 @@ class _HomeScreenState extends State<HomeScreen> {
   // -------------------------------------------------------------------------
   // Direct Both Sides Document Upload & Auto-Registration Flow
   // -------------------------------------------------------------------------
+
+  Map<String, String> _normalizeDocumentFields(Map<String, String> raw) {
+    final out = Map<String, String>.from(raw);
+    String pick(String k, List<String> fbs) {
+      if (out[k] != null && out[k]!.trim().isNotEmpty) return out[k]!.trim();
+      for (final fb in fbs) {
+        if (out[fb] != null && out[fb]!.trim().isNotEmpty) return out[fb]!.trim();
+      }
+      return '';
+    }
+
+    final nameAr = pick('name_ar', ['first_name_ar']);
+    final surnameAr = pick('surname_ar', ['last_name_ar']);
+    final nameFr = pick('name_fr', ['first_name_fr']);
+    final surnameFr = pick('surname_fr', ['last_name_fr']);
+    final card = pick('card', ['nin']);
+    final cni = pick('cni', ['cni_number']);
+    final cniExpire = pick('cni_expire_date', []);
+    final dob = pick('date_of_birth', ['birth_date']);
+    final province = pick('province', ['wilaya']);
+    final city = pick('city', ['commune', 'birth_place']);
+    final mobile = pick('mobile', ['phone']);
+    final address = pick('address', []);
+    final fatherName = pick('father_name', []);
+    final motherName = pick('mother_name', []);
+
+    // Username auto-generation
+    var username = pick('username', []);
+    if (username.isEmpty && nameFr.isNotEmpty && surnameFr.isNotEmpty) {
+      final cleanFirst = nameFr.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      final cleanLast = surnameFr.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      username = '${cleanFirst}_$cleanLast';
+      if (username.length < 5) username = '${username}_dz';
+    }
+
+    // Password auto-generation
+    var password = pick('password', []);
+    if (password.isEmpty) {
+      password = 'Dzds@${DateTime.now().year}!';
+    }
+
+    // Email auto-generation
+    var email = pick('email', []);
+    if (email.isEmpty && username.isNotEmpty) {
+      email = '$username@gmail.com';
+    }
+
+    // Sex normalization
+    var sex = pick('sex', []).toLowerCase();
+    if (sex.contains('ذكر') || sex == 'm' || sex.contains('masculin') || sex.contains('male')) {
+      sex = 'male';
+    } else if (sex.contains('أنثى') || sex.contains('انثى') || sex == 'f' || sex.contains('feminin') || sex.contains('female')) {
+      sex = 'female';
+    } else if (sex.isEmpty) {
+      sex = 'male';
+    }
+
+    // Presumed
+    var presumed = pick('presumed', []).toLowerCase();
+    if (presumed.isEmpty || presumed.contains('لا') || presumed.contains('non')) {
+      presumed = 'no';
+    } else if (presumed.contains('نعم') || presumed.contains('oui')) {
+      presumed = 'yes';
+    }
+
+    out['name_ar'] = nameAr;
+    out['surname_ar'] = surnameAr;
+    out['name_fr'] = nameFr;
+    out['surname_fr'] = surnameFr;
+    out['card'] = card;
+    out['cni'] = cni;
+    out['cni_expire_date'] = cniExpire;
+    out['date_of_birth'] = dob;
+    out['province'] = province;
+    out['city'] = city;
+    out['mobile'] = mobile;
+    out['address'] = address;
+    out['username'] = username;
+    out['password'] = password;
+    out['email'] = email;
+    out['sex'] = sex;
+    out['presumed'] = presumed;
+    if (fatherName.isNotEmpty) out['father_name'] = fatherName;
+    if (motherName.isNotEmpty) out['mother_name'] = motherName;
+
+    return out;
+  }
+
+  Future<String?> _promptPhoneNumber() async {
+    final c = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Row(
+          children: [
+            Icon(Icons.phone_android_rounded, color: Colors.green),
+            SizedBox(width: 8),
+            Text('رقم الهاتف للتسجيل', style: TextStyle(fontSize: 16)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'تم استخراج بيانات بطاقة الهوية بنجاح! يلزم رقم الهاتف لتلقي رمز التفعيل SMS وإتمام التسجيل فوراً.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: c,
+              keyboardType: TextInputType.phone,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'رقم الهاتف (05 / 06 / 07)',
+                hintText: '06XXXXXXXX',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.phone_rounded),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton.icon(
+            icon: const Icon(Icons.arrow_forward_rounded),
+            label: const Text('متابعة التسجيل'),
+            onPressed: () {
+              final val = c.text.trim();
+              Navigator.pop(ctx, val.isNotEmpty ? val : null);
+            },
+          ),
+        ],
+      ),
+    );
+  }
 
   Future<void> _uploadAndRegisterBothSides() async {
     if (_chat.busy) return;
@@ -443,7 +607,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 6),
               Text(
-                'التقط أو اختر وجهي البطاقة (أمامي + خلفي) ليستخرج الذكاء الاصطناعي البيانات ويسجل تلقائياً.',
+                'التقط أو اختر وجهي البطاقة (أمامي + خلفي) ليتم استخراج البيانات والتسجيل التلقائي فوراً.',
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.outline),
               ),
@@ -454,7 +618,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 controller: phoneController,
                 keyboardType: TextInputType.phone,
                 decoration: const InputDecoration(
-                  labelText: 'رقم الهاتف لتلقي رمز SMS (05 / 06 / 07)',
+                  labelText: 'رقم الهاتف لتلقي رمز SMS (اختياري الآن)',
                   prefixIcon: Icon(Icons.phone_android_rounded),
                   border: OutlineInputBorder(),
                   hintText: '06XXXXXXXX',
@@ -535,7 +699,7 @@ class _HomeScreenState extends State<HomeScreen> {
     await _processBothSidesImages(images, phone);
   }
 
-  Future<void> _processBothSidesImages(List<Uint8List> images, String phone) async {
+  Future<void> _processBothSidesImages(List<Uint8List> images, String initialPhone) async {
     if (images.isEmpty) return;
 
     _add(_chat, _ChatItem.user(
@@ -545,7 +709,9 @@ class _HomeScreenState extends State<HomeScreen> {
     ));
     _setBusy(_chat, true);
 
-    _add(_chat, _ChatItem.status('جاري استخراج البيانات من الوجهين بواسطة الذكاء الاصطناعي في دفعة واحدة…'));
+    setState(() {
+      _chat.activeStatus = 'جاري استخراج البيانات من الوجهين بواسطة الذكاء الاصطناعي…';
+    });
 
     try {
       final data = await _chat.agent.extractDocument(
@@ -553,42 +719,375 @@ class _HomeScreenState extends State<HomeScreen> {
         mimeType: 'image/jpeg',
       );
 
-      final combinedFields = Map<String, String>.from(data.fields);
-      if (phone.isNotEmpty) {
-        combinedFields['mobile'] = phone;
-      }
-
-      final completeData = DocumentData(combinedFields);
-      _chat.agent.seedDocument(completeData);
-
-      if (completeData.fields.isEmpty) {
-        _add(_chat, _ChatItem.error('لم نتمكن من قراءة البيانات من الصور. يرجى التأكد من وضوح الإضاءة وإعادة المحاولة.'));
+      if (data.fields.isEmpty) {
         _setBusy(_chat, false);
+        _add(_chat, _ChatItem.error('لم نتمكن من قراءة البيانات من الصور. يرجى التأكد من وضوح الإضاءة وجودة الصورة وإعادة المحاولة.'));
         return;
       }
 
-      // Display summary of extracted fields
-      final summary = completeData.fields.entries
-          .where((e) => e.value.isNotEmpty)
-          .take(8)
-          .map((e) => '• ${e.key}: ${e.value}')
-          .join('\n');
+      var fields = _normalizeDocumentFields(data.fields);
 
+      // Handle phone number
+      var phone = initialPhone.trim();
+      if (phone.isEmpty && (fields['mobile'] == null || fields['mobile']!.isEmpty)) {
+        final saved = await SecureStore.instance.username ?? '';
+        if (saved.startsWith('0') && saved.length == 10) {
+          phone = saved;
+        }
+      }
+
+      if (phone.isEmpty && (fields['mobile'] == null || fields['mobile']!.isEmpty)) {
+        setState(() => _chat.activeStatus = null);
+        final promptPhone = await _promptPhoneNumber();
+        if (promptPhone != null && promptPhone.isNotEmpty) {
+          phone = promptPhone;
+        }
+      }
+
+      if (phone.isNotEmpty) {
+        fields['mobile'] = phone;
+      }
+
+      // Re-normalize with phone
+      fields = _normalizeDocumentFields(fields);
+
+      // Store in session so it is NEVER lost
+      _chat.extractedDocument = DocumentData(fields);
+      _chat.agent.seedDocument(_chat.extractedDocument!);
+
+      // Display clean summary
+      final displayName = '${fields['name_ar']} ${fields['surname_ar']}'.trim();
+      final displayNameFr = '${fields['name_fr']} ${fields['surname_fr']}'.trim();
       _add(_chat, _ChatItem.agent(
-        'تم استخراج كافة البيانات بنجاح من الوجهين (${completeData.fields.length} حقلاً):\n$summary\n\nجاري إنشاء الحساب، توليد اسم المستخدم وكلمة المرور، وتسجيل الدخول التلقائي…',
+        '✅ تم استخراج كافة البيانات بنجاح من الوجهين:\n'
+        '• الاسم واللقب: $displayName ($displayNameFr)\n'
+        '• رقم التعريف الوطني NIN: ${fields['card']}\n'
+        '• رقم بطاقة التعريف CNI: ${fields['cni']}\n'
+        '• تاريخ الميلاد: ${fields['date_of_birth']} (${fields['province']})\n'
+        '• رقم الهاتف: ${fields['mobile']}\n\n'
+        'جاري إنشاء الحساب وإرسال طلب التسجيل فوراً…',
       ));
 
-      // Trigger automatic registration and auto-login
-      _chat.agent.start(
-        'لديك بيانات الوثيقة المستخرجة من الوجهين ورقم الهاتف ${phone.isNotEmpty ? phone : "المطلوب"}. '
-        'أنشئ حساباً جديداً وولّد اسم مستخدم مناسباً وكلمة مرور آمنة من الاسم. '
-        'سجّل الحساب تلقائياً ثم سجّل الدخول فوراً. '
-        'إذا كان الحساب مسجلاً مسبقاً، اطلب كلمة المرور لتسجيل الدخول مباشرة.',
-      );
+      // Direct, fast registration execution
+      await _executeRegistrationFlow(fields);
     } catch (e) {
-      _add(_chat, _ChatItem.error('خطأ أثناء قراءة الوثيقة: $e'));
       _setBusy(_chat, false);
+      _add(_chat, _ChatItem.error('خطأ أثناء قراءة الوثيقة: $e'));
     }
+  }
+
+  Future<void> _executeRegistrationFlow(Map<String, String> fields) async {
+    _setBusy(_chat, true);
+    setState(() {
+      _chat.activeStatus = 'جاري التحقق من الهوية وإرسال طلب التسجيل…';
+    });
+
+    try {
+      final res = await _chat.agent.executeRegistration(fields);
+      setState(() => _chat.activeStatus = null);
+
+      if (res['already_registered'] == true) {
+        _setBusy(_chat, false);
+        _add(_chat, _ChatItem.agent('الحساب أو رقم الهاتف مسجل بالفعل في منصة DZDS! يرجى إدخال كلمة المرور لتسجيل الدخول فوراً.'));
+        _promptLoginPassword(_chat);
+        return;
+      }
+
+      if (res['registered'] == true) {
+        final uname = '${res['username'] ?? fields['username']}';
+        final pass = '${res['password'] ?? fields['password']}';
+        setState(() {
+          _chat.credentials = _Credentials(username: uname, password: pass);
+        });
+        _setBusy(_chat, false);
+        _add(_chat, _ChatItem.agent(
+          '🎉 تم إنشاء الحساب بنجاح وتوليد بيانات الدخول:\n'
+          'اسم المستخدم: $uname\n'
+          'كلمة المرور: $pass\n\n'
+          'تم تسجيل الدخول بنجاح والجلسة نشطة الآن. يمكنك الآن استخراج أي شهادة أو خدمة حكومية بنقرة واحدة من الشريط أدناه!',
+        ));
+        _chat.agent.checkSession();
+        return;
+      }
+
+      // If registration failed (500 or identity verification error, etc.)
+      _setBusy(_chat, false);
+      final errorMsg = '${res['error'] ?? 'حدث خطأ أثناء التسجيل'}';
+      final hint = res['hint']?.toString();
+      _add(_chat, _ChatItem.error('تعذر إتمام التسجيل تلقائياً: $errorMsg'));
+
+      // Pop up editable details modal so user can fix and retry!
+      _showEditDetailsModal(fields, errorMsg, hint: hint);
+    } catch (e) {
+      _setBusy(_chat, false);
+      _add(_chat, _ChatItem.error('خطأ في الاتصال: $e'));
+      _showEditDetailsModal(fields, '$e');
+    }
+  }
+
+  void _showEditDetailsModal(Map<String, String> currentFields, String errorMsg, {String? hint}) {
+    final nameArCtrl = TextEditingController(text: currentFields['name_ar'] ?? '');
+    final surnameArCtrl = TextEditingController(text: currentFields['surname_ar'] ?? '');
+    final nameFrCtrl = TextEditingController(text: currentFields['name_fr'] ?? '');
+    final surnameFrCtrl = TextEditingController(text: currentFields['surname_fr'] ?? '');
+    final cardCtrl = TextEditingController(text: currentFields['card'] ?? '');
+    final cniCtrl = TextEditingController(text: currentFields['cni'] ?? '');
+    final cniExpireCtrl = TextEditingController(text: currentFields['cni_expire_date'] ?? '');
+    final dobCtrl = TextEditingController(text: currentFields['date_of_birth'] ?? '');
+    final provinceCtrl = TextEditingController(text: currentFields['province'] ?? '');
+    final cityCtrl = TextEditingController(text: currentFields['city'] ?? '');
+    final mobileCtrl = TextEditingController(text: currentFields['mobile'] ?? '');
+    String selectedSex = currentFields['sex'] == 'female' ? 'female' : 'male';
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) => Padding(
+          padding: EdgeInsets.only(
+            bottom: MediaQuery.of(ctx).viewInsets.bottom,
+            left: 20,
+            right: 20,
+            top: 16,
+          ),
+          child: SafeArea(
+            child: SizedBox(
+              height: MediaQuery.of(ctx).size.height * 0.85,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 44,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade300,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Row(
+                    children: [
+                      Icon(Icons.edit_note_rounded, color: Colors.blue, size: 26),
+                      SizedBox(width: 8),
+                      Text(
+                        'مراجعة وتعديل بيانات التسجيل',
+                        style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Error notification banner
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.amber.shade50,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.amber.shade400, width: 0.8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.warning_amber_rounded, size: 18, color: Colors.amber.shade900),
+                            const SizedBox(width: 6),
+                            const Text(
+                              'تنبيه أثناء التحقق من الخادم',
+                              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.brown),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          hint ?? errorMsg,
+                          style: TextStyle(fontSize: 12, color: Colors.brown.shade800),
+                        ),
+                        const SizedBox(height: 2),
+                        const Text(
+                          'يرجى مراجعة وتصحيح الحقول أدناه ثم الضغط على "إعادة إرسال طلب التسجيل":',
+                          style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: Colors.brown),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Form Fields
+                  Expanded(
+                    child: ListView(
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: nameArCtrl,
+                                decoration: const InputDecoration(labelText: 'الاسم (بالعربية)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: TextField(
+                                controller: surnameArCtrl,
+                                decoration: const InputDecoration(labelText: 'اللقب (بالعربية)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: nameFrCtrl,
+                                decoration: const InputDecoration(labelText: 'Prénom (Latin)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: TextField(
+                                controller: surnameFrCtrl,
+                                decoration: const InputDecoration(labelText: 'Nom (Latin)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: cardCtrl,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'رقم التعريف الوطني NIN (18 رقماً)',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            prefixIcon: Icon(Icons.badge_rounded),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: cniCtrl,
+                                decoration: const InputDecoration(labelText: 'رقم بطاقة CNI (9 أرقام)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: TextField(
+                                controller: cniExpireCtrl,
+                                decoration: const InputDecoration(labelText: 'تاريخ انتهاء CNI (YYYY-MM-DD)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: dobCtrl,
+                                decoration: const InputDecoration(labelText: 'تاريخ الميلاد (YYYY-MM-DD)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: DropdownButtonFormField<String>(
+                                value: selectedSex,
+                                decoration: const InputDecoration(labelText: 'الجنس', border: OutlineInputBorder(), isDense: true),
+                                items: const [
+                                  DropdownMenuItem(value: 'male', child: Text('ذكر (Male)')),
+                                  DropdownMenuItem(value: 'female', child: Text('أنثى (Female)')),
+                                ],
+                                onChanged: (v) => setModalState(() => selectedSex = v ?? 'male'),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: provinceCtrl,
+                                decoration: const InputDecoration(labelText: 'الولاية (Province)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: TextField(
+                                controller: cityCtrl,
+                                decoration: const InputDecoration(labelText: 'البلدية (City)', border: OutlineInputBorder(), isDense: true),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: mobileCtrl,
+                          keyboardType: TextInputType.phone,
+                          decoration: const InputDecoration(
+                            labelText: 'رقم الهاتف (05 / 06 / 07)',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                            prefixIcon: Icon(Icons.phone_android_rounded),
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+                      ],
+                    ),
+                  ),
+
+                  // Bottom action buttons
+                  Row(
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: const Text('إلغاء'),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton.icon(
+                          icon: const Icon(Icons.send_rounded),
+                          label: const Text('إعادة إرسال طلب التسجيل'),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            final updated = Map<String, String>.from(currentFields);
+                            updated['name_ar'] = nameArCtrl.text.trim();
+                            updated['surname_ar'] = surnameArCtrl.text.trim();
+                            updated['name_fr'] = nameFrCtrl.text.trim();
+                            updated['surname_fr'] = surnameFrCtrl.text.trim();
+                            updated['card'] = cardCtrl.text.trim();
+                            updated['cni'] = cniCtrl.text.trim();
+                            updated['cni_expire_date'] = cniExpireCtrl.text.trim();
+                            updated['date_of_birth'] = dobCtrl.text.trim();
+                            updated['province'] = provinceCtrl.text.trim();
+                            updated['city'] = cityCtrl.text.trim();
+                            updated['mobile'] = mobileCtrl.text.trim();
+                            updated['sex'] = selectedSex;
+
+                            final normalized = _normalizeDocumentFields(updated);
+                            _chat.extractedDocument = DocumentData(normalized);
+                            _chat.agent.seedDocument(_chat.extractedDocument!);
+                            _executeRegistrationFlow(normalized);
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _pickBothSidesDocument(_ChatSession session) async {
@@ -1384,7 +1883,7 @@ class _QuickAction extends StatelessWidget {
 // Chat item
 // ---------------------------------------------------------------------------
 
-enum _Kind { user, agent, status, error, authPrompt }
+enum _Kind { user, agent, error, authPrompt }
 
 class _ChatItem {
   final _Kind kind;
@@ -1401,12 +1900,6 @@ class _ChatItem {
 
   _ChatItem.agent(this.text)
       : kind = _Kind.agent,
-        title = null,
-        onUpload = null,
-        onLogin = null;
-
-  _ChatItem.status(this.text)
-      : kind = _Kind.status,
         title = null,
         onUpload = null,
         onLogin = null;
@@ -1478,28 +1971,6 @@ class _ChatItem {
                     ),
                   ),
                   child: Text(text, style: const TextStyle(fontSize: 14)),
-                ),
-              ),
-            ],
-          ),
-        );
-
-      case _Kind.status:
-        return Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SizedBox(
-                width: 12,
-                height: 12,
-                child: CircularProgressIndicator(strokeWidth: 1.5, color: scheme.primary),
-              ),
-              const SizedBox(width: 8),
-              Flexible(
-                child: Text(
-                  text,
-                  style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: scheme.outline),
                 ),
               ),
             ],

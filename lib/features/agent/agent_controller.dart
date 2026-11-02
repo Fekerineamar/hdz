@@ -149,6 +149,9 @@ class AgentController {
     } else if (turn.text != null && turn.text!.isNotEmpty) {
       _checkSessionQuietly();
       _emit(AgentDone(turn.text!));
+    } else {
+      _checkSessionQuietly();
+      _emit(AgentDone(''));
     }
   }
 
@@ -230,6 +233,29 @@ class AgentController {
   /// direct upload so the agent already has the fields before its first turn).
   void seedDocument(DocumentData data) {
     _executor.seedDocumentContext(data);
+  }
+
+  /// Direct registration without extra Gemini turn.
+  /// Calls the tested tool executor logic directly, triggering human-in-the-loop
+  /// hooks (captcha / SMS) and updating credentials/session automatically.
+  Future<Map<String, Object?>> executeRegistration(Map<String, dynamic> fields) async {
+    final id = ++_runId;
+    try {
+      _emit(AgentStatus('جاري التحقق من الهوية وإرسال طلب التسجيل…'));
+      final result = await _executor.execute(FunctionCall('register', fields));
+      if (_cancelled(id)) return result;
+      _checkSessionQuietly();
+      return result;
+    } catch (e) {
+      if (!_cancelled(id)) {
+        _emit(AgentError('$e'));
+      }
+      return {'error': '$e'};
+    } finally {
+      if (!_cancelled(id)) {
+        _emit(AgentStatus(''));
+      }
+    }
   }
 
   void dispose() {

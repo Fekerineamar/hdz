@@ -680,24 +680,80 @@ class ToolExecutor {
   }
 
   Future<Map<String, Object?>> _register(Map<String, Object?> args) async {
-    String s(String k) => '${args[k] ?? ''}'.trim();
+    String s(String k, [List<String> fallbacks = const []]) {
+      var val = '${args[k] ?? _documentContext[k] ?? ''}'.trim();
+      if (val.isNotEmpty) return val;
+      for (final fb in fallbacks) {
+        val = '${args[fb] ?? _documentContext[fb] ?? ''}'.trim();
+        if (val.isNotEmpty) return val;
+      }
+      return '';
+    }
+
+    final nameAr = s('name_ar', ['first_name_ar']);
+    final surnameAr = s('surname_ar', ['last_name_ar']);
+    final nameFr = s('name_fr', ['first_name_fr']);
+    final surnameFr = s('surname_fr', ['last_name_fr']);
+
+    // Auto-generate username if not provided
+    var username = s('username');
+    if (username.isEmpty && nameFr.isNotEmpty && surnameFr.isNotEmpty) {
+      final cleanFirst = nameFr.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      final cleanLast = surnameFr.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+      username = '${cleanFirst}_$cleanLast';
+      if (username.length < 5) username = '${username}_dz';
+    }
+
+    // Auto-generate password if not provided
+    var password = s('password');
+    if (password.isEmpty) {
+      password = 'Dzds@${DateTime.now().year}!';
+    }
+
+    // Auto-generate email if not provided
+    var email = s('email');
+    if (email.isEmpty && username.isNotEmpty) {
+      email = '$username@gmail.com';
+    }
+
+    // Mobile fallback to phone
+    final mobile = s('mobile', ['phone']);
+
+    // Sex normalization
+    var sex = s('sex').toLowerCase();
+    if (sex.contains('ذكر') || sex == 'm' || sex.contains('masculin') || sex.contains('male')) {
+      sex = 'male';
+    } else if (sex.contains('أنثى') || sex.contains('انثى') || sex == 'f' || sex.contains('feminin') || sex.contains('female')) {
+      sex = 'female';
+    } else if (sex.isEmpty) {
+      sex = 'male';
+    }
+
+    // Presumed default to 'no'
+    var presumed = s('presumed').toLowerCase();
+    if (presumed.isEmpty || presumed.contains('لا') || presumed.contains('non')) {
+      presumed = 'no';
+    } else if (presumed.contains('نعم') || presumed.contains('oui')) {
+      presumed = 'yes';
+    }
+
     final data = RegistrationData(
-      username: s('username'),
-      password: s('password'),
-      mobile: s('mobile'),
-      email: s('email'),
-      surnameAr: s('surname_ar'),
-      nameAr: s('name_ar'),
-      surnameFr: s('surname_fr'),
-      nameFr: s('name_fr'),
-      card: s('card'),
-      cni: s('cni'),
+      username: username,
+      password: password,
+      mobile: mobile,
+      email: email,
+      surnameAr: surnameAr,
+      nameAr: nameAr,
+      surnameFr: surnameFr,
+      nameFr: nameFr,
+      card: s('card', ['nin']),
+      cni: s('cni', ['cni_number']),
       cniExpireDate: s('cni_expire_date'),
-      presumed: s('presumed'),
-      dateOfBirth: s('date_of_birth'),
-      sex: s('sex'),
-      province: s('province'),
-      city: s('city'),
+      presumed: presumed,
+      dateOfBirth: s('date_of_birth', ['birth_date']),
+      sex: sex,
+      province: s('province', ['wilaya']),
+      city: s('city', ['commune', 'birth_place']),
       address: s('address'),
     );
 
